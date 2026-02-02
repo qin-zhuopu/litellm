@@ -279,6 +279,16 @@ def initialize_callbacks_on_proxy(  # noqa: PLR0915
                     callback_specific_params=callback_specific_params,
                 )
                 imported_list.append(websearch_interception_obj)
+            elif isinstance(callback, str) and callback == "request_response_logger":
+                from litellm.proxy.hooks.request_response_logger import (
+                    RequestResponseLogger,
+                )
+
+                request_response_logger_obj = RequestResponseLogger.initialize_from_proxy_config(
+                    litellm_settings=litellm_settings,
+                    callback_specific_params=callback_specific_params,
+                )
+                imported_list.append(request_response_logger_obj)
             elif isinstance(callback, CustomLogger):
                 imported_list.append(callback)
             else:

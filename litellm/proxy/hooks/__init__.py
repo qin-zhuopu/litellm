@@ -7,6 +7,7 @@ from .litellm_skills import SkillsInjectionHook
 from .max_budget_limiter import _PROXY_MaxBudgetLimiter
 from .parallel_request_limiter import _PROXY_MaxParallelRequestsHandler
 from .parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
+from .request_response_logger import RequestResponseLogger
 from .responses_id_security import ResponsesIDSecurity
 
 ### CHECK IF ENTERPRISE HOOKS ARE AVAILABLE ####
@@ -23,6 +24,7 @@ PROXY_HOOKS = {
     "cache_control_check": _PROXY_CacheControlCheck,
     "responses_id_security": ResponsesIDSecurity,
     "litellm_skills": SkillsInjectionHook,
+    "request_response_logger": RequestResponseLogger,
 }
 
 ## FEATURE FLAG HOOKS ##

@@ -53,6 +53,118 @@ from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 from litellm.types.utils import ModelResponse, ModelResponseStream, Usage
 
 
+def _adjust_max_tokens_for_context_window(data: dict, llm_router=None) -> None:
+    """
+    Dynamically adjust max_tokens to ensure it fits within the Qwen model's
+    context window limit of 40960 tokens.
+
+    Uses a coefficient-based reduction approach. Reduces max_tokens by
+    multiplying with 0.5 repeatedly until under limit, minimum 1024.
+
+    Args:
+        data: Request data dict
+        llm_router: Optional Router instance (not currently used)
+    """
+    # Qwen models have 40960 token limit
+    QWEN_CONTEXT_WINDOW = 40960
+    SAFETY_MARGIN = 500
+    MIN_MAX_TOKENS = 1024
+
+    # Get max_tokens from request
+    max_tokens = data.get("max_tokens")
+    if max_tokens is None:
+        return  # No max_tokens specified
+
+    # Estimate input tokens (rough estimation)
+    estimated_input_tokens = _estimate_input_tokens(data)
+
+    # Since token estimation is very inaccurate, use coefficient-based reduction
+    # Reserve space for hidden context that we can't estimate (system prompts, etc.)
+    HIDDEN_CONTEXT_RESERVE = 25000  # Conservative reserve for hidden context
+
+    # Calculate safe limit for max_tokens
+    # We want: estimated_input + max_tokens + hidden_reserve <= limit
+    safe_max_tokens_limit = QWEN_CONTEXT_WINDOW - HIDDEN_CONTEXT_RESERVE - SAFETY_MARGIN
+
+    verbose_proxy_logger.info(
+        f"[TOKEN_ADJUST] original_max_tokens={max_tokens}, "
+        f"estimated_input={estimated_input_tokens}, "
+        f"safe_max_tokens_limit={safe_max_tokens_limit}, "
+        f"context_window_limit={QWEN_CONTEXT_WINDOW}"
+    )
+
+    # If max_tokens exceeds safe limit, reduce it using coefficient approach
+    if max_tokens > safe_max_tokens_limit:
+        # Reduce max_tokens by multiplying with 0.5 until under safe limit
+        REDUCTION_COEFFICIENT = 0.5
+
+        original_max_tokens = max_tokens
+        while max_tokens > safe_max_tokens_limit:
+            new_max_tokens = int(max_tokens * REDUCTION_COEFFICIENT)
+            if new_max_tokens < MIN_MAX_TOKENS:
+                new_max_tokens = MIN_MAX_TOKENS
+                break
+            max_tokens = new_max_tokens
+
+        data["max_tokens"] = max_tokens
+        verbose_proxy_logger.warning(
+            f"[TOKEN_ADJUST] Reduced max_tokens from {original_max_tokens} to {max_tokens} "
+            f"(safe_limit={safe_max_tokens_limit}, min={MIN_MAX_TOKENS})"
+        )
+
+
+def _estimate_input_tokens(data: dict) -> int:
+    """
+    Estimate the number of input tokens from messages/prompt.
+
+    Uses a simple heuristic: ~4 characters per token for English text.
+    For messages, counts the total characters in all message content.
+    """
+    estimated_tokens = 0
+
+    # Count from messages
+    messages = data.get("messages") or []
+    total_chars = 0
+
+    for message in messages:
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                # Handle multimodal content (text + images)
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            text = item.get("text", "")
+                            total_chars += len(text)
+                        elif item.get("type") == "image":
+                            # Images typically count as ~85-1000 tokens depending on resolution
+                            # Use a conservative estimate
+                            estimated_tokens += 1000
+
+    # Rough estimate: ~4 characters per token
+    estimated_tokens += total_chars // 4
+
+    # Count from system prompt
+    system = data.get("system")
+    if system and isinstance(system, str):
+        estimated_tokens += len(system) // 4
+
+    # Count from prompt (for completion API)
+    prompt = data.get("prompt")
+    if prompt and isinstance(prompt, str):
+        estimated_tokens += len(prompt) // 4
+
+    # Log the estimation for debugging
+    verbose_proxy_logger.info(
+        f"[TOKEN_ESTIMATE] messages={len(messages)}, chars={total_chars}, "
+        f"estimated_tokens={estimated_tokens}"
+    )
+
+    return max(1, estimated_tokens)  # At least 1 token
+
+
 async def _parse_event_data_for_error(event_line: Union[str, bytes]) -> Optional[int]:
     """Parses an event line and returns an error code if present, else None."""
     event_line = (
@@ -512,6 +624,17 @@ class ProxyBaseLLMRequestProcessing:
         ):
             self.data["model"] = user_api_key_dict.aliases[self.data["model"]]
 
+        ### FORCE ALL REQUESTS TO QWEN MODEL ###
+        # Override model to always use Qwen3-235B-A22B-GPTQ-Int4
+        FORCED_MODEL = "Qwen3-235B-A22B-GPTQ-Int4"
+        original_model = self.data.get("model", "")
+        self.data["model"] = FORCED_MODEL
+        # Save original model for logging purposes
+        self.data["original_model"] = original_model
+        verbose_proxy_logger.info(
+            f"[MODEL_OVERRIDE] Forced model: {original_model} -> {FORCED_MODEL}"
+        )
+
         self.data["litellm_call_id"] = request.headers.get(
             "x-litellm-call-id", str(uuid.uuid4())
         )
@@ -661,6 +784,10 @@ class ProxyBaseLLMRequestProcessing:
         # Pass contents if provided
         if contents:
             self.data["contents"] = contents
+
+        # Adjust max_tokens for context window limits
+        # This ensures (input_tokens + max_tokens) fits within the model's context window
+        _adjust_max_tokens_for_context_window(self.data, llm_router)
 
         ### ROUTE THE REQUEST ###
         # Do not change this - it should be a constant time fetch - ALWAYS
