@@ -53,63 +53,110 @@ from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 from litellm.types.utils import ModelResponse, ModelResponseStream, Usage
 
 
-def _adjust_max_tokens_for_context_window(data: dict, llm_router=None) -> None:
+def _adjust_max_tokens_for_context_window(data: dict, llm_router=None, proxy_config=None) -> None:
     """
-    Dynamically adjust max_tokens to ensure it fits within the Qwen model's
-    context window limit of 40960 tokens.
+    Dynamically adjust max_tokens to ensure it fits within the model's
+    configured max_tokens_limit.
 
     Uses a coefficient-based reduction approach. Reduces max_tokens by
     multiplying with 0.5 repeatedly until under limit, minimum 1024.
 
+    The max_tokens_limit is configured per model in model_list (top-level, not in litellm_params):
+        model_list:
+          - model_name: my-model
+            litellm_params:
+              model: openai/my-model
+            max_tokens_limit: 15460  # Adjust max_tokens if exceeds this value
+
+    If max_tokens_limit is not set for a model, no adjustment is performed.
+
     Args:
         data: Request data dict
-        llm_router: Optional Router instance (not currently used)
+        llm_router: Optional Router instance to get model list
+        proxy_config: Optional ProxyConfig instance to read model config
     """
-    # Qwen models have 40960 token limit
-    QWEN_CONTEXT_WINDOW = 40960
     SAFETY_MARGIN = 500
     MIN_MAX_TOKENS = 1024
+    REDUCTION_COEFFICIENT = 0.5
 
     # Get max_tokens from request
     max_tokens = data.get("max_tokens")
     if max_tokens is None:
         return  # No max_tokens specified
 
-    # Estimate input tokens (rough estimation)
-    estimated_input_tokens = _estimate_input_tokens(data)
+    # Get the model name from request
+    model_name = data.get("model", "")
+    if not model_name:
+        return
 
-    # Since token estimation is very inaccurate, use coefficient-based reduction
-    # Reserve space for hidden context that we can't estimate (system prompts, etc.)
-    HIDDEN_CONTEXT_RESERVE = 25000  # Conservative reserve for hidden context
+    # Find max_tokens_limit from model configuration
+    max_tokens_limit = None
 
-    # Calculate safe limit for max_tokens
-    # We want: estimated_input + max_tokens + hidden_reserve <= limit
-    safe_max_tokens_limit = QWEN_CONTEXT_WINDOW - HIDDEN_CONTEXT_RESERVE - SAFETY_MARGIN
+    # Try to get from router's model list first
+    if llm_router is not None:
+        try:
+            model_list = llm_router.get_model_list()
+            if model_list:
+                for model_config in model_list:
+                    # Match by model_name (top-level)
+                    if model_config.get("model_name") == model_name:
+                        max_tokens_limit = model_config.get("max_tokens_limit")
+                        break
+                    # Also check if the litellm_params.model matches
+                    litellm_params = model_config.get("litellm_params", {})
+                    if litellm_params.get("model") == model_name:
+                        max_tokens_limit = model_config.get("max_tokens_limit")
+                        break
+        except Exception:
+            pass
+
+    # If not found in router, try proxy_config
+    if max_tokens_limit is None and proxy_config is not None:
+        try:
+            model_list = proxy_config.config.get("model_list", [])
+            for model_config in model_list:
+                if model_config.get("model_name") == model_name:
+                    max_tokens_limit = model_config.get("max_tokens_limit")
+                    break
+                litellm_params = model_config.get("litellm_params", {})
+                if litellm_params.get("model") == model_name:
+                    max_tokens_limit = model_config.get("max_tokens_limit")
+                    break
+        except Exception:
+            pass
+
+    # If no max_tokens_limit configured for this model, don't adjust
+    if max_tokens_limit is None:
+        verbose_proxy_logger.debug(
+            f"[TOKEN_ADJUST] No max_tokens_limit configured for model '{model_name}', skipping adjustment"
+        )
+        return
+
+    # Calculate safe limit (subtract safety margin)
+    safe_max_tokens_limit = max_tokens_limit - SAFETY_MARGIN
 
     verbose_proxy_logger.info(
-        f"[TOKEN_ADJUST] original_max_tokens={max_tokens}, "
-        f"estimated_input={estimated_input_tokens}, "
-        f"safe_max_tokens_limit={safe_max_tokens_limit}, "
-        f"context_window_limit={QWEN_CONTEXT_WINDOW}"
+        f"[TOKEN_ADJUST] model={model_name}, original_max_tokens={max_tokens}, "
+        f"max_tokens_limit={max_tokens_limit}, safe_limit={safe_max_tokens_limit}"
     )
 
     # If max_tokens exceeds safe limit, reduce it using coefficient approach
     if max_tokens > safe_max_tokens_limit:
-        # Reduce max_tokens by multiplying with 0.5 until under safe limit
-        REDUCTION_COEFFICIENT = 0.5
-
         original_max_tokens = max_tokens
         while max_tokens > safe_max_tokens_limit:
             new_max_tokens = int(max_tokens * REDUCTION_COEFFICIENT)
             if new_max_tokens < MIN_MAX_TOKENS:
                 new_max_tokens = MIN_MAX_TOKENS
-                break
+                # If even the minimum is above safe limit, use minimum and break
+                if new_max_tokens > safe_max_tokens_limit:
+                    max_tokens = new_max_tokens
+                    break
             max_tokens = new_max_tokens
 
         data["max_tokens"] = max_tokens
         verbose_proxy_logger.warning(
             f"[TOKEN_ADJUST] Reduced max_tokens from {original_max_tokens} to {max_tokens} "
-            f"(safe_limit={safe_max_tokens_limit}, min={MIN_MAX_TOKENS})"
+            f"(limit={max_tokens_limit}, safe_limit={safe_max_tokens_limit}, min={MIN_MAX_TOKENS})"
         )
 
 
@@ -624,16 +671,24 @@ class ProxyBaseLLMRequestProcessing:
         ):
             self.data["model"] = user_api_key_dict.aliases[self.data["model"]]
 
-        ### FORCE ALL REQUESTS TO QWEN MODEL ###
-        # Override model to always use Qwen3-235B-A22B-GPTQ-Int4
-        FORCED_MODEL = "Qwen3-235B-A22B-GPTQ-Int4"
-        original_model = self.data.get("model", "")
-        self.data["model"] = FORCED_MODEL
-        # Save original model for logging purposes
-        self.data["original_model"] = original_model
-        verbose_proxy_logger.info(
-            f"[MODEL_OVERRIDE] Forced model: {original_model} -> {FORCED_MODEL}"
-        )
+        ### FORCE ALL REQUESTS TO A SPECIFIC MODEL ###
+        # Override model if forced_model is set via config or environment variable
+        import os
+        FORCED_MODEL = os.environ.get("LITELLM_FORCED_MODEL")
+
+        # Check litellm_settings for forced_model config
+        if proxy_config is not None:
+            litellm_settings = proxy_config.config.get("litellm_settings", {})
+            config_forced_model = litellm_settings.get("forced_model")
+            if config_forced_model:
+                FORCED_MODEL = config_forced_model
+
+        if FORCED_MODEL:
+            original_model = self.data.get("model", "")
+            self.data["model"] = FORCED_MODEL
+            verbose_proxy_logger.info(
+                f"[MODEL_OVERRIDE] Forced model: {original_model} -> {FORCED_MODEL}"
+            )
 
         self.data["litellm_call_id"] = request.headers.get(
             "x-litellm-call-id", str(uuid.uuid4())
@@ -787,7 +842,7 @@ class ProxyBaseLLMRequestProcessing:
 
         # Adjust max_tokens for context window limits
         # This ensures (input_tokens + max_tokens) fits within the model's context window
-        _adjust_max_tokens_for_context_window(self.data, llm_router)
+        _adjust_max_tokens_for_context_window(self.data, llm_router, proxy_config)
 
         ### ROUTE THE REQUEST ###
         # Do not change this - it should be a constant time fetch - ALWAYS

@@ -108,3 +108,4 @@ LAZY_LOADING_IMPROVEMENTS.md
 **/coverage
 litellm/proxy/_experimental/out/
 logs
+.test_venv
