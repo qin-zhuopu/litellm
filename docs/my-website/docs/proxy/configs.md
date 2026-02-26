@@ -171,6 +171,39 @@ Look for this line in your console logs to confirm the config.yaml was loaded in
 LiteLLM: Proxy initialized with Config, Set models:
 ```
 
+### Force Non-Streaming Mode
+
+:::tip
+**Server config takes priority over client request**
+
+When you set `stream: false` in `litellm_params`, the proxy will enforce non-streaming mode for all requests to that model, even if the client explicitly requests `stream: true`.
+
+This is useful when:
+- Your upstream provider doesn't support streaming properly
+- You want to avoid streaming-related issues (e.g., tool calls being formatted as text)
+- You need consistent response handling regardless of client preferences
+:::
+
+```yaml
+model_list:
+  - model_name: claude-3-5-sonnet
+    litellm_params:
+      model: anthropic/Qwen3-30B-A3B-Instruct-2507
+      api_base: http://172.30.128.1:8008
+      api_key: "anything"
+      stream: false  # Force non-streaming - client requests won't override this
+```
+
+**Behavior:**
+
+| Client Request | Server Config | Actual Behavior |
+|---------------|---------------|-----------------|
+| `stream: true` | `stream: false` | Non-streaming ✅ |
+| `stream: false` | `stream: false` | Non-streaming |
+| (not specified) | `stream: false` | Non-streaming |
+| `stream: true` | (not specified) | Streaming (client wins) |
+| `stream: false` | (not specified) | Non-streaming |
+
 ### Embedding Models - Use Sagemaker, Bedrock, Azure, OpenAI, XInference
 
 See supported Embedding Providers & Models [here](https://docs.litellm.ai/docs/embedding/supported_embedding)
