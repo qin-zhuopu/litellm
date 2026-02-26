@@ -280,8 +280,11 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             elif key == "web_search_options":
                 self._add_web_search_tool(responses_api_request, value)
 
-        # Get stream parameter from litellm_params if not in optional_params
-        stream = optional_params.get("stream") or litellm_params.get("stream", False)
+        # Get stream parameter - server config (litellm_params) takes priority over client request (optional_params)
+        if "stream" in litellm_params:
+            stream = litellm_params["stream"]
+        else:
+            stream = optional_params.get("stream", False)
         verbose_logger.debug(f"Chat provider: Stream parameter: {stream}")
 
         # Ensure stream is properly set in the request

@@ -32,9 +32,13 @@ class ResponsesToCompletionBridgeHandler:
 
     @staticmethod
     def _resolve_stream_flag(optional_params: dict, litellm_params: dict) -> bool:
-        stream = optional_params.get("stream")
-        if stream is None:
-            stream = litellm_params.get("stream", False)
+        # Server config (litellm_params) takes priority over client request (optional_params)
+        # If stream is explicitly set in litellm_params, use that value
+        if "stream" in litellm_params:
+            stream = litellm_params["stream"]
+        # Otherwise, fall back to client request (optional_params)
+        else:
+            stream = optional_params.get("stream", False)
         return bool(stream)
 
     @staticmethod
